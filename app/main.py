@@ -21,6 +21,7 @@ from app.pipeline import (
     BATCH_SIZE,
     HF_TOKEN,
     DEFAULT_MODEL,
+    KEEP_ALIVE,
     load_whisper_model,
     clear_gpu_memory,
     format_timestamp,
@@ -53,6 +54,7 @@ app = FastAPI(
 logger.info(f"WhisperX ASR Service v{__version__} initialized on device: {DEVICE}")
 logger.info(f"Compute type: {COMPUTE_TYPE}, Batch size: {BATCH_SIZE}")
 logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
+logger.info(f"Keep-alive: {'infinite' if KEEP_ALIVE < 0 else 'unload immediately' if KEEP_ALIVE == 0 else f'{KEEP_ALIVE}s'}")
 
 
 @app.on_event("startup")

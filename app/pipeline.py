@@ -8,6 +8,7 @@ Ray Serve deployments.
 
 import os
 import gc
+import re
 import math
 import logging
 import threading
@@ -33,9 +34,12 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 CACHE_DIR = os.getenv("CACHE_DIR", "/.cache")
-DEFAULT_MODEL = os.getenv("PRELOAD_MODEL", "large-v3")
+# DEFAULT_MODEL is decoupled from PRELOAD_MODEL; falls back to PRELOAD_MODEL for
+# backward-compatibility, then to "large-v3".
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", os.getenv("PRELOAD_MODEL", "large-v3"))
 
 _model_load_lock = threading.Lock()
+_timer_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Model caches
@@ -43,6 +47,51 @@ _model_load_lock = threading.Lock()
 _whisper_models: Dict[str, Any] = {}
 _align_models: Dict[str, Tuple[Any, Any]] = {}
 _diarize_pipeline: Optional[DiarizationPipeline] = None
+_model_timers: Dict[str, threading.Timer] = {}
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive helpers
+# ---------------------------------------------------------------------------
+_DURATION_RE = re.compile(r'^(\d+(?:\.\d+)?)\s*([smhd]?)$')
+
+
+def parse_keep_alive(value) -> float:
+    """
+    Parse a keep_alive value to seconds.
+
+    Accepted forms (matching ollama convention):
+      - Any negative number or string starting with '-' (e.g. -1, "-1m") → -1.0 (keep forever)
+      - 0 / "0"                                                           → 0.0  (unload immediately)
+      - Positive integer / float (e.g. 3600, "3600")                      → that many seconds
+      - Duration string with a single unit suffix (e.g. "10m", "24h",
+        "30s", "2d")                                                       → converted to seconds
+
+    Returns -1.0 for infinite retention, 0.0 for immediate unload, or a
+    positive float representing the number of seconds to keep the model loaded.
+    """
+    if value is None:
+        return -1.0
+    s = str(value).strip()
+    if not s:
+        return -1.0
+    if s.startswith('-'):
+        return -1.0
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = _DURATION_RE.match(s)
+    if m:
+        num = float(m.group(1))
+        unit = m.group(2)
+        multipliers = {'s': 1.0, 'm': 60.0, 'h': 3600.0, 'd': 86400.0, '': 1.0}
+        return num * multipliers[unit]
+    raise ValueError(f"Cannot parse keep_alive value: {value!r}")
+
+
+# Read and parse KEEP_ALIVE once at import time.
+KEEP_ALIVE: float = parse_keep_alive(os.getenv("KEEP_ALIVE", "-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +157,48 @@ def load_diarize_pipeline() -> DiarizationPipeline:
     return _diarize_pipeline
 
 
+def unload_whisper_model(model_name: str) -> None:
+    """Remove a WhisperX model from the cache and free GPU memory."""
+    # Clean up the timer reference first (without holding _model_load_lock to avoid deadlock).
+    with _timer_lock:
+        _model_timers.pop(model_name, None)
+    with _model_load_lock:
+        if model_name in _whisper_models:
+            del _whisper_models[model_name]
+            clear_gpu_memory()
+            logger.info(f"Model '{model_name}' unloaded from memory (keep_alive expired)")
+
+
+def _schedule_model_unload(model_name: str) -> None:
+    """
+    Start (or reset) the keep-alive countdown for *model_name*.
+
+    Behaviour driven by the global KEEP_ALIVE setting:
+      KEEP_ALIVE < 0  → do nothing; model stays loaded indefinitely
+      KEEP_ALIVE == 0 → unload immediately after use
+      KEEP_ALIVE > 0  → (re)schedule unload after KEEP_ALIVE seconds
+    """
+    if KEEP_ALIVE < 0:
+        return
+
+    # Cancel any existing countdown for this model.
+    with _timer_lock:
+        existing = _model_timers.pop(model_name, None)
+        if existing is not None:
+            existing.cancel()
+
+    if KEEP_ALIVE == 0:
+        # Unload synchronously; we're already done with the GPU work.
+        unload_whisper_model(model_name)
+    else:
+        with _timer_lock:
+            timer = threading.Timer(KEEP_ALIVE, unload_whisper_model, args=[model_name])
+            timer.daemon = True
+            timer.start()
+            _model_timers[model_name] = timer
+        logger.debug(f"Keep-alive timer set: model '{model_name}' unloads in {KEEP_ALIVE}s")
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 -- Transcription
 # ---------------------------------------------------------------------------
@@ -148,6 +239,7 @@ def transcribe(
     logger.info(f"Transcription complete. Detected language: {detected_language}")
 
     clear_gpu_memory()
+    _schedule_model_unload(model_name)
     return result
 
 
