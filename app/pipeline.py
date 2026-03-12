@@ -162,10 +162,11 @@ def unload_whisper_model(model_name: str) -> None:
     with _timer_lock:
         _model_timers.pop(model_name, None)
     with _model_load_lock:
-        if model_name in _whisper_models:
-            del _whisper_models[model_name]
-            clear_gpu_memory()
-            logger.info(f"Model '{model_name}' unloaded from memory (keep_alive expired)")
+        model = _whisper_models.pop(model_name, None)
+    if model is not None:
+        del model
+        clear_gpu_memory()
+        logger.info(f"Model '{model_name}' unloaded from memory (keep_alive expired)")
 
 
 def unload_align_model(language_code: str) -> None:
@@ -173,10 +174,16 @@ def unload_align_model(language_code: str) -> None:
     with _timer_lock:
         _model_timers.pop(f"align:{language_code}", None)
     with _model_load_lock:
-        if language_code in _align_models:
-            del _align_models[language_code]
-            clear_gpu_memory()
-            logger.info(f"Alignment model '{language_code}' unloaded from memory (keep_alive expired)")
+        entry = _align_models.pop(language_code, None)
+    if entry is not None:
+        model_a, metadata = entry
+        try:
+            model_a.to("cpu")
+        except Exception:
+            pass
+        del model_a, metadata
+        clear_gpu_memory()
+        logger.info(f"Alignment model '{language_code}' unloaded from memory (keep_alive expired)")
 
 
 def unload_diarize_pipeline() -> None:
@@ -185,10 +192,16 @@ def unload_diarize_pipeline() -> None:
     with _timer_lock:
         _model_timers.pop("diarize", None)
     with _model_load_lock:
-        if _diarize_pipeline is not None:
-            _diarize_pipeline = None
-            clear_gpu_memory()
-            logger.info("Diarization pipeline unloaded from memory (keep_alive expired)")
+        pipeline = _diarize_pipeline
+        _diarize_pipeline = None
+    if pipeline is not None:
+        try:
+            pipeline.to(torch.device("cpu"))
+        except Exception:
+            pass
+        del pipeline
+        clear_gpu_memory()
+        logger.info("Diarization pipeline unloaded from memory (keep_alive expired)")
 
 
 def _schedule_unload(key: str, unload_fn, *args) -> None:
@@ -270,6 +283,7 @@ def transcribe(
     detected_language = result.get("language", language or "en")
     logger.info(f"Transcription complete. Detected language: {detected_language}")
 
+    whisper_model = None  # release before potential synchronous unload
     clear_gpu_memory()
     _schedule_model_unload(model_name)
     return result
@@ -293,6 +307,7 @@ def align(audio: np.ndarray, result: dict) -> dict:
             return_char_alignments=False,
         )
         logger.info("Timestamp alignment complete")
+        model_a = metadata = None  # release before potential synchronous unload
         clear_gpu_memory()
         _schedule_align_unload(detected_language)
     except Exception as e:
@@ -354,6 +369,7 @@ def diarize(
 
         result = whisperx.assign_word_speakers(diarize_segments, result)
         logger.info("Speaker diarization complete")
+        diarize_model = None  # release before potential synchronous unload
         clear_gpu_memory()
         _schedule_diarize_unload()
     except Exception as e:
