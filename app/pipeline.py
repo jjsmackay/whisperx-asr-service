@@ -159,7 +159,6 @@ def load_diarize_pipeline() -> DiarizationPipeline:
 
 def unload_whisper_model(model_name: str) -> None:
     """Remove a WhisperX model from the cache and free GPU memory."""
-    # Clean up the timer reference first (without holding _model_load_lock to avoid deadlock).
     with _timer_lock:
         _model_timers.pop(model_name, None)
     with _model_load_lock:
@@ -169,9 +168,32 @@ def unload_whisper_model(model_name: str) -> None:
             logger.info(f"Model '{model_name}' unloaded from memory (keep_alive expired)")
 
 
-def _schedule_model_unload(model_name: str) -> None:
+def unload_align_model(language_code: str) -> None:
+    """Remove an alignment model from the cache and free GPU memory."""
+    with _timer_lock:
+        _model_timers.pop(f"align:{language_code}", None)
+    with _model_load_lock:
+        if language_code in _align_models:
+            del _align_models[language_code]
+            clear_gpu_memory()
+            logger.info(f"Alignment model '{language_code}' unloaded from memory (keep_alive expired)")
+
+
+def unload_diarize_pipeline() -> None:
+    """Remove the diarization pipeline from memory and free GPU memory."""
+    global _diarize_pipeline
+    with _timer_lock:
+        _model_timers.pop("diarize", None)
+    with _model_load_lock:
+        if _diarize_pipeline is not None:
+            _diarize_pipeline = None
+            clear_gpu_memory()
+            logger.info("Diarization pipeline unloaded from memory (keep_alive expired)")
+
+
+def _schedule_unload(key: str, unload_fn, *args) -> None:
     """
-    Start (or reset) the keep-alive countdown for *model_name*.
+    Start (or reset) the keep-alive countdown for *key*.
 
     Behaviour driven by the global KEEP_ALIVE setting:
       KEEP_ALIVE < 0  → do nothing; model stays loaded indefinitely
@@ -181,22 +203,32 @@ def _schedule_model_unload(model_name: str) -> None:
     if KEEP_ALIVE < 0:
         return
 
-    # Cancel any existing countdown for this model.
     with _timer_lock:
-        existing = _model_timers.pop(model_name, None)
+        existing = _model_timers.pop(key, None)
         if existing is not None:
             existing.cancel()
 
     if KEEP_ALIVE == 0:
-        # Unload synchronously; we're already done with the GPU work.
-        unload_whisper_model(model_name)
+        unload_fn(*args)
     else:
         with _timer_lock:
-            timer = threading.Timer(KEEP_ALIVE, unload_whisper_model, args=[model_name])
+            timer = threading.Timer(KEEP_ALIVE, unload_fn, args=list(args))
             timer.daemon = True
             timer.start()
-            _model_timers[model_name] = timer
-        logger.debug(f"Keep-alive timer set: model '{model_name}' unloads in {KEEP_ALIVE}s")
+            _model_timers[key] = timer
+        logger.debug(f"Keep-alive timer set: '{key}' unloads in {KEEP_ALIVE}s")
+
+
+def _schedule_model_unload(model_name: str) -> None:
+    _schedule_unload(model_name, unload_whisper_model, model_name)
+
+
+def _schedule_align_unload(language_code: str) -> None:
+    _schedule_unload(f"align:{language_code}", unload_align_model, language_code)
+
+
+def _schedule_diarize_unload() -> None:
+    _schedule_unload("diarize", unload_diarize_pipeline)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +294,7 @@ def align(audio: np.ndarray, result: dict) -> dict:
         )
         logger.info("Timestamp alignment complete")
         clear_gpu_memory()
+        _schedule_align_unload(detected_language)
     except Exception as e:
         logger.warning(f"Timestamp alignment failed: {e}, continuing without word-level timestamps")
     return result
@@ -322,6 +355,7 @@ def diarize(
         result = whisperx.assign_word_speakers(diarize_segments, result)
         logger.info("Speaker diarization complete")
         clear_gpu_memory()
+        _schedule_diarize_unload()
     except Exception as e:
         logger.warning(f"Speaker diarization failed: {e}, continuing without diarization")
 
