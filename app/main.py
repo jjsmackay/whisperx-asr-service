@@ -34,11 +34,16 @@ from app.queue import run_in_queue, get_queue_metrics
 # Suppress pyannote pooling warnings about degrees of freedom
 warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
 
-# Configure logging
+# Configure logging.
+# basicConfig is a no-op when uvicorn has already added handlers to the root
+# logger (which it does before importing the app).  Explicitly setting the
+# level on the "app" namespace ensures all app.* loggers emit INFO records
+# that propagate up to uvicorn's handlers.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logging.getLogger("app").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1000"))
