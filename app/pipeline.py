@@ -90,8 +90,8 @@ def parse_keep_alive(value) -> float:
     raise ValueError(f"Cannot parse keep_alive value: {value!r}")
 
 
-# Read and parse KEEP_ALIVE once at import time.
-KEEP_ALIVE: float = parse_keep_alive(os.getenv("KEEP_ALIVE", "-1"))
+# Read and parse MODEL_KEEP_ALIVE once at import time.
+MODEL_KEEP_ALIVE: float = parse_keep_alive(os.getenv("MODEL_KEEP_ALIVE", "-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ def _schedule_unload(key: str, unload_fn, *args) -> None:
       KEEP_ALIVE == 0 → unload immediately after use
       KEEP_ALIVE > 0  → (re)schedule unload after KEEP_ALIVE seconds
     """
-    if KEEP_ALIVE < 0:
+    if MODEL_KEEP_ALIVE < 0:
         return
 
     with _timer_lock:
@@ -221,15 +221,15 @@ def _schedule_unload(key: str, unload_fn, *args) -> None:
         if existing is not None:
             existing.cancel()
 
-    if KEEP_ALIVE == 0:
+    if MODEL_KEEP_ALIVE == 0:
         unload_fn(*args)
     else:
         with _timer_lock:
-            timer = threading.Timer(KEEP_ALIVE, unload_fn, args=list(args))
+            timer = threading.Timer(MODEL_KEEP_ALIVE, unload_fn, args=list(args))
             timer.daemon = True
             timer.start()
             _model_timers[key] = timer
-        logger.debug(f"Keep-alive timer set: '{key}' unloads in {KEEP_ALIVE}s")
+        logger.debug(f"Model keep-alive timer set: '{key}' unloads in {MODEL_KEEP_ALIVE}s")
 
 
 def _schedule_model_unload(model_name: str) -> None:
