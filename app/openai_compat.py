@@ -8,13 +8,11 @@ GET /v1/models
 import os
 import tempfile
 import logging
-import time
 from typing import Optional, List, Union
 from pathlib import Path
 
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-import whisperx
 
 from app.schemas import (
     ResponseFormat,
@@ -25,18 +23,9 @@ from app.schemas import (
     OpenAIErrorResponse,
 )
 from app.pipeline import (
-    DEVICE,
-    BATCH_SIZE,
-    CACHE_DIR,
     DEFAULT_MODEL,
-    load_whisper_model,
-    clear_gpu_memory,
     format_timestamp,
-    transcribe as pipeline_transcribe,
-    align as pipeline_align,
-    _whisper_models as loaded_models,
 )
-from app.queue import run_in_queue
 
 logger = logging.getLogger(__name__)
 
@@ -158,26 +147,6 @@ def format_vtt_response(result: dict) -> str:
     return "\n".join(vtt_content)
 
 
-def _run_transcribe_and_align(
-    audio,
-    whisperx_model: str,
-    language: Optional[str],
-    task: str,
-    need_word_timestamps: bool,
-    hotwords: Optional[str] = None,
-):
-    """Blocking helper that runs transcription + optional alignment on GPU."""
-    result = pipeline_transcribe(
-        audio,
-        model_name=whisperx_model,
-        language=language,
-        task=task,
-        hotwords=hotwords,
-    )
-    if need_word_timestamps:
-        result = pipeline_align(audio, result)
-    return result
-
 
 async def process_audio(
     file: UploadFile,
@@ -242,25 +211,22 @@ async def process_audio(
 
         logger.info(f"OpenAI-compat: Processing {file.filename} ({file_size_mb:.1f}MB), model: {whisperx_model}, task: {task}")
 
-        # Load audio
-        audio = whisperx.load_audio(temp_audio_path)
-        duration = len(audio) / 16000  # WhisperX loads at 16kHz
-
         need_word_timestamps = (
             response_format == ResponseFormat.VERBOSE_JSON and
             "word" in timestamp_granularities
         )
 
-        # Run through the async queue
-        result = await run_in_queue(
-            _run_transcribe_and_align,
-            audio,
-            whisperx_model,
-            language,
-            task,
-            need_word_timestamps,
+        from app.main import _worker_pool   # lazy import avoids circular reference at module level
+        result, _ = await _worker_pool.asubmit(
+            temp_audio_path,
+            model_name=whisperx_model,
+            language=language,
+            task=task,
+            word_timestamps=need_word_timestamps,
+            should_diarize=False,
             hotwords=hotwords or prompt,
         )
+        duration = result.get("_duration", 0.0)   # set by worker.py
 
         detected_language = result.get("language", language or "en")
 

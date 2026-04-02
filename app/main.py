@@ -7,65 +7,75 @@ import os
 import tempfile
 import logging
 import warnings
+from contextlib import asynccontextmanager
 from typing import Optional
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import JSONResponse
-import whisperx
 
 from app.version import __version__
 from app.pipeline import (
     DEVICE,
     COMPUTE_TYPE,
     BATCH_SIZE,
-    HF_TOKEN,
     DEFAULT_MODEL,
-    load_whisper_model,
-    clear_gpu_memory,
+    MODEL_KEEP_ALIVE,
     format_timestamp,
     sanitize_float_values,
-    run_pipeline,
     _whisper_models as loaded_models,
 )
-from app.queue import run_in_queue, get_queue_metrics
+from app.worker_pool import WORKER_KEEP_ALIVE
+from app.queue import get_queue_metrics
 
 # Suppress pyannote pooling warnings about degrees of freedom
 warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
 
-# Configure logging
+# Configure logging.
+# basicConfig is a no-op when uvicorn has already added handlers to the root
+# logger (which it does before importing the app).  Explicitly setting the
+# level on the "app" namespace ensures all app.* loggers emit INFO records
+# that propagate up to uvicorn's handlers.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logging.getLogger("app").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1000"))
 SERVE_MODE = os.getenv("SERVE_MODE", "simple")
 
+_worker_pool = None   # set in lifespan; referenced by openai_compat via lazy import
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _worker_pool
+    if SERVE_MODE == "simple":
+        from app.worker_pool import WorkerPool
+        _worker_pool = WorkerPool()
+        logger.info("WorkerPool created (worker subprocess spawns on first request)")
+    yield
+    if _worker_pool is not None:
+        _worker_pool.shutdown()
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="WhisperX ASR API",
     description="Automatic Speech Recognition API with Speaker Diarization using WhisperX",
-    version=__version__
+    version=__version__,
+    lifespan=lifespan,
 )
 
 logger.info(f"WhisperX ASR Service v{__version__} initialized on device: {DEVICE}")
 logger.info(f"Compute type: {COMPUTE_TYPE}, Batch size: {BATCH_SIZE}")
 logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Preload models on startup"""
-    preload_model = os.getenv("PRELOAD_MODEL", None)
-    if preload_model:
-        logger.info(f"Preloading model on startup: {preload_model}")
-        try:
-            load_whisper_model(preload_model)
-            logger.info(f"Successfully preloaded model: {preload_model}")
-        except Exception as e:
-            logger.error(f"Failed to preload model {preload_model}: {str(e)}")
+logger.info(
+    f"Model keep-alive: {'infinite' if MODEL_KEEP_ALIVE < 0 else 'unload immediately' if MODEL_KEEP_ALIVE == 0 else f'{MODEL_KEEP_ALIVE}s'}, "
+    f"Worker keep-alive: {'infinite' if WORKER_KEEP_ALIVE < 0 else 'unload immediately' if WORKER_KEEP_ALIVE == 0 else f'{WORKER_KEEP_ALIVE}s'}"
+)
 
 
 @app.get("/")
@@ -151,13 +161,8 @@ async def transcribe_audio(
 
         logger.info(f"Processing audio file: {audio_file.filename} ({file_size_mb:.1f}MB), model: {model}, language: {language}")
 
-        # Load audio
-        audio = whisperx.load_audio(temp_audio_path)
-
-        # Run pipeline through the async queue (GPU semaphore)
-        result, speaker_embeddings = await run_in_queue(
-            run_pipeline,
-            audio,
+        result, speaker_embeddings = await _worker_pool.asubmit(
+            temp_audio_path,
             model_name=model,
             language=language,
             task=task,

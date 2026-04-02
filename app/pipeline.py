@@ -8,6 +8,7 @@ Ray Serve deployments.
 
 import os
 import gc
+import re
 import math
 import logging
 import threading
@@ -33,9 +34,12 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 CACHE_DIR = os.getenv("CACHE_DIR", "/.cache")
-DEFAULT_MODEL = os.getenv("PRELOAD_MODEL", "large-v3")
+# DEFAULT_MODEL is decoupled from PRELOAD_MODEL; falls back to PRELOAD_MODEL for
+# backward-compatibility, then to "large-v3".
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", os.getenv("PRELOAD_MODEL", "large-v3"))
 
 _model_load_lock = threading.Lock()
+_timer_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Model caches
@@ -43,6 +47,51 @@ _model_load_lock = threading.Lock()
 _whisper_models: Dict[str, Any] = {}
 _align_models: Dict[str, Tuple[Any, Any]] = {}
 _diarize_pipeline: Optional[DiarizationPipeline] = None
+_model_timers: Dict[str, threading.Timer] = {}
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive helpers
+# ---------------------------------------------------------------------------
+_DURATION_RE = re.compile(r'^(\d+(?:\.\d+)?)\s*([smhd]?)$')
+
+
+def parse_keep_alive(value) -> float:
+    """
+    Parse a keep_alive value to seconds.
+
+    Accepted forms (matching ollama convention):
+      - Any negative number or string starting with '-' (e.g. -1, "-1m") → -1.0 (keep forever)
+      - 0 / "0"                                                           → 0.0  (unload immediately)
+      - Positive integer / float (e.g. 3600, "3600")                      → that many seconds
+      - Duration string with a single unit suffix (e.g. "10m", "24h",
+        "30s", "2d")                                                       → converted to seconds
+
+    Returns -1.0 for infinite retention, 0.0 for immediate unload, or a
+    positive float representing the number of seconds to keep the model loaded.
+    """
+    if value is None:
+        return -1.0
+    s = str(value).strip()
+    if not s:
+        return -1.0
+    if s.startswith('-'):
+        return -1.0
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = _DURATION_RE.match(s)
+    if m:
+        num = float(m.group(1))
+        unit = m.group(2)
+        multipliers = {'s': 1.0, 'm': 60.0, 'h': 3600.0, 'd': 86400.0, '': 1.0}
+        return num * multipliers[unit]
+    raise ValueError(f"Cannot parse keep_alive value: {value!r}")
+
+
+# Read and parse MODEL_KEEP_ALIVE once at import time.
+MODEL_KEEP_ALIVE: float = parse_keep_alive(os.getenv("MODEL_KEEP_ALIVE", "-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +157,93 @@ def load_diarize_pipeline() -> DiarizationPipeline:
     return _diarize_pipeline
 
 
+def unload_whisper_model(model_name: str) -> None:
+    """Remove a WhisperX model from the cache and free GPU memory."""
+    with _timer_lock:
+        _model_timers.pop(model_name, None)
+    with _model_load_lock:
+        model = _whisper_models.pop(model_name, None)
+    if model is not None:
+        del model
+        clear_gpu_memory()
+        logger.info(f"Model '{model_name}' unloaded from memory (keep_alive expired)")
+
+
+def unload_align_model(language_code: str) -> None:
+    """Remove an alignment model from the cache and free GPU memory."""
+    with _timer_lock:
+        _model_timers.pop(f"align:{language_code}", None)
+    with _model_load_lock:
+        entry = _align_models.pop(language_code, None)
+    if entry is not None:
+        model_a, metadata = entry
+        try:
+            model_a.to("cpu")
+        except Exception:
+            pass
+        del model_a, metadata
+        clear_gpu_memory()
+        logger.info(f"Alignment model '{language_code}' unloaded from memory (keep_alive expired)")
+
+
+def unload_diarize_pipeline() -> None:
+    """Remove the diarization pipeline from memory and free GPU memory."""
+    global _diarize_pipeline
+    with _timer_lock:
+        _model_timers.pop("diarize", None)
+    with _model_load_lock:
+        pipeline = _diarize_pipeline
+        _diarize_pipeline = None
+    if pipeline is not None:
+        try:
+            pipeline.to(torch.device("cpu"))
+        except Exception:
+            pass
+        del pipeline
+        clear_gpu_memory()
+        logger.info("Diarization pipeline unloaded from memory (keep_alive expired)")
+
+
+def _schedule_unload(key: str, unload_fn, *args) -> None:
+    """
+    Start (or reset) the keep-alive countdown for *key*.
+
+    Behaviour driven by the global KEEP_ALIVE setting:
+      KEEP_ALIVE < 0  → do nothing; model stays loaded indefinitely
+      KEEP_ALIVE == 0 → unload immediately after use
+      KEEP_ALIVE > 0  → (re)schedule unload after KEEP_ALIVE seconds
+    """
+    if MODEL_KEEP_ALIVE < 0:
+        return
+
+    with _timer_lock:
+        existing = _model_timers.pop(key, None)
+        if existing is not None:
+            existing.cancel()
+
+    if MODEL_KEEP_ALIVE == 0:
+        unload_fn(*args)
+    else:
+        with _timer_lock:
+            timer = threading.Timer(MODEL_KEEP_ALIVE, unload_fn, args=list(args))
+            timer.daemon = True
+            timer.start()
+            _model_timers[key] = timer
+        logger.debug(f"Model keep-alive timer set: '{key}' unloads in {MODEL_KEEP_ALIVE}s")
+
+
+def _schedule_model_unload(model_name: str) -> None:
+    _schedule_unload(model_name, unload_whisper_model, model_name)
+
+
+def _schedule_align_unload(language_code: str) -> None:
+    _schedule_unload(f"align:{language_code}", unload_align_model, language_code)
+
+
+def _schedule_diarize_unload() -> None:
+    _schedule_unload("diarize", unload_diarize_pipeline)
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 -- Transcription
 # ---------------------------------------------------------------------------
@@ -147,7 +283,9 @@ def transcribe(
     detected_language = result.get("language", language or "en")
     logger.info(f"Transcription complete. Detected language: {detected_language}")
 
+    whisper_model = None  # release before potential synchronous unload
     clear_gpu_memory()
+    _schedule_model_unload(model_name)
     return result
 
 
@@ -169,7 +307,9 @@ def align(audio: np.ndarray, result: dict) -> dict:
             return_char_alignments=False,
         )
         logger.info("Timestamp alignment complete")
+        model_a = metadata = None  # release before potential synchronous unload
         clear_gpu_memory()
+        _schedule_align_unload(detected_language)
     except Exception as e:
         logger.warning(f"Timestamp alignment failed: {e}, continuing without word-level timestamps")
     return result
@@ -229,7 +369,9 @@ def diarize(
 
         result = whisperx.assign_word_speakers(diarize_segments, result)
         logger.info("Speaker diarization complete")
+        diarize_model = None  # release before potential synchronous unload
         clear_gpu_memory()
+        _schedule_diarize_unload()
     except Exception as e:
         logger.warning(f"Speaker diarization failed: {e}, continuing without diarization")
 
