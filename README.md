@@ -11,6 +11,15 @@
 
 A simple ASR API service powered by WhisperX for transcription with speaker diarization. Built for self-hosters running [Speakr](https://github.com/murtaza-nasir/speakr) or similar applications.
 
+> **v0.3.2: two Docker image variants are now published per release.**
+>
+> | Your GPU | Pull this tag |
+> |----------|---------------|
+> | **RTX 50xx (Blackwell)** | `learnedmachine/whisperx-asr-service:blackwell` (PyTorch 2.8.0 / cu128) |
+> | Anything else (10xx, 20xx, 30xx, 40xx, A-series, H-series) | `learnedmachine/whisperx-asr-service:latest` (PyTorch 2.7.1 / cu126) |
+>
+> The `:latest` tag was previously broken on Pascal cards. v0.3.2 fixes this by re-pinning torch after the WhisperX install. See [Image Variants](#image-variants) and [Changelog](#changelog).
+
 ## What This Does
 
 - Transcribes audio files using OpenAI Whisper models
@@ -149,6 +158,9 @@ Download the docker-compose.yml file and start the service:
 # Download docker-compose.yml
 curl -O https://raw.githubusercontent.com/murtaza-nasir/whisperx-asr-service/main/docker-compose.yml
 
+# RTX 50xx (Blackwell) only: switch to the blackwell image
+# sed -i 's|whisperx-asr-service:latest|whisperx-asr-service:blackwell|' docker-compose.yml
+
 # Start the service (pulls prebuilt image automatically)
 docker compose up -d
 
@@ -156,9 +168,18 @@ docker compose up -d
 docker compose logs -f
 ```
 
+The bundled `docker-compose.yml` uses `:latest` (PyTorch 2.7.1 / cu126),
+which works on every NVIDIA card from Pascal through Hopper. RTX 50xx
+users should swap to `:blackwell` (PyTorch 2.8.0 / cu128). See
+[Image Variants](#image-variants) for the full matrix.
+
 **Or run with Docker command:**
 
 ```bash
+# Pick the right tag for your GPU:
+IMAGE=learnedmachine/whisperx-asr-service:latest      # 10xx-40xx, A/H-series
+# IMAGE=learnedmachine/whisperx-asr-service:blackwell # RTX 50xx only
+
 docker run -d \
   --name whisperx-asr-api \
   --gpus all \
@@ -170,7 +191,7 @@ docker run -d \
   -e PRELOAD_MODEL=large-v3 \
   -v whisperx-cache:/.cache \
   --restart unless-stopped \
-  learnedmachine/whisperx-asr-service:latest
+  "$IMAGE"
 ```
 
 The service will be available at `http://localhost:9000`
@@ -513,8 +534,8 @@ Both strategies achieve similar throughput (~6.3-6.5x speedup on 4x RTX 3090 wit
 
 | | Replicate | Split |
 |---|-----------|-------|
-| **Configuration** | Simple -- just set `NUM_GPU_REPLICAS` | Complex -- GPU fractions, per-stage replicas, bin-packing tuning |
-| **Cross-GPU transfer** | None -- audio stays on one GPU | Yes -- results move between stages |
+| **Configuration** | Simple (just set `NUM_GPU_REPLICAS`) | Complex (GPU fractions, per-stage replicas, bin-packing tuning) |
+| **Cross-GPU transfer** | None (audio stays on one GPU) | Yes (results move between stages) |
 | **Tail latency** | Higher variance | Lower and more consistent |
 | **Scaling** | Add a GPU, add a replica | Scale bottleneck stages independently (e.g. more Whisper replicas) |
 | **VRAM per GPU** | Must fit all 3 models | Each stage uses a fraction |
@@ -883,16 +904,26 @@ If exposing to a network:
 
 ### Updating WhisperX
 
+If you run the prebuilt image, pull the new tag:
+
 ```bash
-# Pull latest changes
-git pull
-
-# Rebuild image
-docker compose build --no-cache
-
-# Restart service
+docker compose pull
 docker compose up -d
 ```
+
+If you build from source, the default build now installs PyTorch 2.7.1
+from the cu126 wheel index (Pascal-Hopper). To target a different combo:
+
+```bash
+git pull
+docker compose build --no-cache \
+  --build-arg TORCH_VERSION=2.8.0 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+docker compose up -d
+```
+
+Build args also work via Compose's `build.args` if you check that into
+your overlay file.
 
 ### Clearing Cache
 
@@ -967,13 +998,38 @@ For issues and questions:
 ## Changelog
 
 ### v0.3.2 (2026-05-03)
-- **Pascal/Blackwell image variants (#15):** `:latest` ships PyTorch 2.7.1 (cu126, supports Pascal through Hopper). New `:blackwell` tag ships PyTorch 2.8.0 (cu128) for RTX 50xx. The `Dockerfile` now exposes `TORCH_VERSION` and `TORCH_INDEX_URL` build args and re-pins torch after the WhisperX install so the requested version sticks.
-- **Device-aware `BATCH_SIZE` default (#12):** the default is now 16 on cuda and 2 on cpu. Long CPU runs no longer OOM-kill (exit 137) under the previous 16 default.
-- **Idle model eviction (#16):** new `MODEL_KEEP_ALIVE_SECONDS` env var (default 0/disabled) unloads Whisper models that have been idle longer than the configured window. `MODEL_EVICTION_INTERVAL_SECONDS` controls sweep frequency (floor 30s).
-- **Real Prometheus `/metrics` (#13):** `/metrics` now returns OpenMetrics text instead of JSON. New histograms and counters cover request duration, status, audio duration/size, in-flight requests, loaded model count, model evictions, and VRAM. The previous JSON shape is preserved at `/queue-metrics`.
-- `/asr` accepts the OpenAI-style aliases advertised by `/v1/models` (`whisper-1`, `whisper-tiny`, `whisper-large-v3`, ...).
-- `/v1/models` is sourced from `faster_whisper.available_models()` instead of a hardcoded list.
-- `app.*` log records from Ray Serve replicas now flow into the per-replica log file.
+
+**Reported issues fixed**
+
+- **Pascal/Blackwell image variants (#15):** `:latest` ships PyTorch 2.7.1 (cu126, supports Pascal through Hopper). New `:blackwell` tag ships PyTorch 2.8.0 (cu128) for RTX 50xx. The `Dockerfile` now exposes `TORCH_VERSION` and `TORCH_INDEX_URL` build args and re-pins torch *after* the WhisperX install so the requested version sticks (the upstream fork was silently upgrading torch to 2.8 and breaking Pascal). CI publishes both variants per release with separate buildx cache scopes; either job can fail independently.
+- **Device-aware `BATCH_SIZE` default (#12):** the default is now 16 on cuda and 2 on cpu. The hardcoded 16 was OOM-killing CPU runs (exit 137) on audio longer than ~30 minutes.
+- **Idle model eviction (#16):** new `MODEL_KEEP_ALIVE_SECONDS` env var (default 0/disabled) unloads Whisper models that have been idle longer than the configured window. `MODEL_EVICTION_INTERVAL_SECONDS` controls sweep frequency (floor 30s). The next request that needs an evicted model reloads it transparently.
+- **Real Prometheus `/metrics` (#13):** `/metrics` now returns OpenMetrics text instead of JSON. New histograms and counters cover request duration, status, audio duration/size, in-flight requests, loaded model count, model evictions, and VRAM. The previous JSON shape is preserved at `/queue-metrics` for callers that depended on it. See [Prometheus Metrics](#prometheus-metrics) for the full table and the Ray Serve caveat.
+
+**Other fixes shipped in v0.3.2**
+
+- `/asr` accepts the OpenAI-style aliases advertised by `/v1/models` (`whisper-1`, `whisper-tiny`, `whisper-large-v3`, ...). Previously these returned a 500 because the raw value was passed straight through to `faster_whisper.WhisperModel`.
+- `/v1/models` is sourced from `faster_whisper.available_models()` instead of a hardcoded list, so the advertised set stays in sync with whatever engine version is installed (about 20 canonical names plus the `whisper-1` alias).
+- `app.*` log records from Ray Serve replicas now flow into the per-replica log file. Previously `Loading WhisperX model: X`, `Starting transcription...`, etc. were silently dropped because Ray Serve disables propagation on its own logger.
+- `whisperx_model_evictions_total{model="<name>"}` is pre-registered with value 0 each time a model loads, so dashboards can graph the metric from the first load onward instead of only after the first eviction. Simple mode only; see the Ray Serve caveat.
+
+**New env vars**
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_KEEP_ALIVE_SECONDS` | `0` (disabled) | Idle window after which a Whisper model is unloaded |
+| `MODEL_EVICTION_INTERVAL_SECONDS` | `60` (floor 30) | Sweep cadence for the eviction daemon |
+
+**New build args**
+
+| Build arg | Default | Description |
+|---|---|---|
+| `TORCH_VERSION` | `2.7.1` | PyTorch version to install |
+| `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` | PyTorch wheel index URL |
+
+**Tests**
+
+`tests/test_v0_3_2.sh` and `tests/test_keep_alive.sh` cover the new endpoints and eviction logic; both verified end-to-end against a Ray Serve container.
 
 ### v0.3.0 (2026-02-28)
 - Thread-safe model loading with double-checked locking for concurrent request safety
