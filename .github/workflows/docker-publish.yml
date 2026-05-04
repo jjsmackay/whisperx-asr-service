@@ -79,7 +79,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKER_IMAGE }}
           short-description: "WhisperX ASR API Service - Speech Recognition with Speaker Diarization"
-          readme-filepath: ./README.md
+          readme-filepath: ./DOCKERHUB.md
 
   build-blackwell:
     runs-on: ubuntu-latest
