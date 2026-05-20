@@ -8,6 +8,7 @@ import time
 import tempfile
 import logging
 import warnings
+from contextlib import asynccontextmanager
 from typing import Optional
 from pathlib import Path
 
@@ -46,21 +47,10 @@ logger = logging.getLogger(__name__)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1000"))
 SERVE_MODE = os.getenv("SERVE_MODE", "simple")
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="WhisperX ASR API",
-    description="Automatic Speech Recognition API with Speaker Diarization using WhisperX",
-    version=__version__
-)
 
-logger.info(f"WhisperX ASR Service v{__version__} initialized on device: {DEVICE}")
-logger.info(f"Compute type: {COMPUTE_TYPE}, Batch size: {BATCH_SIZE}")
-logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Preload models on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: preload models on startup."""
     prom_metrics.SERVICE_INFO.info({
         "version": __version__,
         "device": DEVICE,
@@ -75,6 +65,20 @@ async def startup_event():
             logger.info(f"Successfully preloaded model: {preload_model}")
         except Exception as e:
             logger.error(f"Failed to preload model {preload_model}: {str(e)}")
+    yield
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="WhisperX ASR API",
+    description="Automatic Speech Recognition API with Speaker Diarization using WhisperX",
+    version=__version__,
+    lifespan=lifespan,
+)
+
+logger.info(f"WhisperX ASR Service v{__version__} initialized on device: {DEVICE}")
+logger.info(f"Compute type: {COMPUTE_TYPE}, Batch size: {BATCH_SIZE}")
+logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
 
 
 @app.get("/")
