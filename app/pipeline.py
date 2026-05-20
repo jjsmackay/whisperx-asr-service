@@ -34,7 +34,7 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16" if DEVICE == "cuda" else "2"))
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 CACHE_DIR = os.getenv("CACHE_DIR", "/.cache")
-DEFAULT_MODEL = os.getenv("PRELOAD_MODEL", "large-v3")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL") or os.getenv("PRELOAD_MODEL", "large-v3")
 
 # Idle model eviction. Set MODEL_KEEP_ALIVE_SECONDS > 0 to unload Whisper
 # models that have not been used in that many seconds. Floor of 30s on the
