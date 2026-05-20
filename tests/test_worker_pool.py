@@ -68,3 +68,36 @@ async def test_pool_asubmit_works():
         assert result == {"echo": "async.wav", "kwargs": {"model_name": "tiny"}}
     finally:
         pool.shutdown()
+
+
+def crashing_entry(request_q, response_q):
+    """Stub worker that crashes hard on the first request."""
+    msg = request_q.get()
+    if msg is None:
+        return
+    import os
+    os._exit(2)
+
+
+def test_pool_raises_when_worker_crashes():
+    pool = WorkerPool(worker_entry=crashing_entry, keep_alive_seconds=-1)
+    try:
+        with pytest.raises(RuntimeError, match=r"exit code"):
+            pool.submit("doomed.wav")
+    finally:
+        pool.shutdown()
+
+
+def test_pool_recovers_after_crash():
+    """After a crash, the next submit should respawn cleanly."""
+    pool = WorkerPool(worker_entry=crashing_entry, keep_alive_seconds=-1)
+    try:
+        # First submit crashes
+        with pytest.raises(RuntimeError):
+            pool.submit("doom1.wav")
+        # Swap in the echo entry so the next spawn works
+        pool._worker_entry = echo_entry
+        result, _ = pool.submit("recovery.wav")
+        assert result == {"echo": "recovery.wav", "kwargs": {}}
+    finally:
+        pool.shutdown()
