@@ -41,6 +41,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# uvicorn applies logging.config.dictConfig() before our basicConfig runs,
+# so set the "app" namespace level explicitly here.
+logging.getLogger("app").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1000"))
