@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, Query, HTTPException
+from fastapi import FastAPI, File, UploadFile, Query, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 import whisperx
 
@@ -32,6 +32,7 @@ from app.pipeline import (
     _whisper_models as loaded_models,
 )
 from app.queue import run_in_queue, get_queue_metrics
+from app.worker_pool import WorkerPool
 from app import metrics as prom_metrics
 
 # Suppress pyannote pooling warnings about degrees of freedom
@@ -53,7 +54,10 @@ SERVE_MODE = os.getenv("SERVE_MODE", "simple")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: preload models on startup."""
+    """Application lifespan: manage the WorkerPool subprocess for VRAM
+    isolation. Model preload now happens lazily inside the worker process
+    (the parent has no CUDA context), so PRELOAD_MODEL is a no-op here.
+    """
     prom_metrics.SERVICE_INFO.info({
         "version": __version__,
         "device": DEVICE,
@@ -62,13 +66,20 @@ async def lifespan(app: FastAPI):
     })
     preload_model = os.getenv("PRELOAD_MODEL", None)
     if preload_model:
-        logger.info(f"Preloading model on startup: {preload_model}")
-        try:
-            load_whisper_model(preload_model)
-            logger.info(f"Successfully preloaded model: {preload_model}")
-        except Exception as e:
-            logger.error(f"Failed to preload model {preload_model}: {str(e)}")
-    yield
+        # TODO: forward PRELOAD_MODEL to the worker subprocess once the
+        # WorkerPool exposes a warmup hook. Parent-side preload would
+        # bind CUDA in the wrong process.
+        logger.info(
+            f"PRELOAD_MODEL={preload_model} set; preload now happens lazily "
+            "inside the worker subprocess (parent-side preload skipped)."
+        )
+    app.state.worker_pool = WorkerPool()
+    logger.info("WorkerPool initialised")
+    try:
+        yield
+    finally:
+        app.state.worker_pool.shutdown()
+        logger.info("WorkerPool shutdown complete")
 
 
 # Initialize FastAPI app
@@ -98,6 +109,7 @@ async def root():
 
 @app.post("/asr")
 async def transcribe_audio(
+    request: Request,
     audio_file: UploadFile = File(...),
     task: str = Query("transcribe"),
     language: Optional[str] = Query(None),
@@ -176,14 +188,15 @@ async def transcribe_audio(
 
         logger.info(f"Processing audio file: {audio_file.filename} ({file_size_mb:.1f}MB), model: {model}, language: {language}")
 
-        # Load audio
+        # Load audio in the parent purely so we can observe duration. The
+        # worker subprocess will re-load the file internally; we pass the
+        # FILE PATH (not the array) across the process boundary.
         audio = whisperx.load_audio(temp_audio_path)
         prom_metrics.AUDIO_DURATION.observe(len(audio) / 16000.0)
 
-        # Run pipeline through the async queue (GPU semaphore)
-        result, speaker_embeddings = await run_in_queue(
-            run_pipeline,
-            audio,
+        # Delegate transcription to the worker subprocess for VRAM isolation.
+        result, speaker_embeddings = await request.app.state.worker_pool.asubmit(
+            temp_audio_path,
             model_name=model,
             language=language,
             task=task,
