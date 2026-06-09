@@ -45,25 +45,35 @@ MODEL_EVICTION_INTERVAL_SECONDS = max(
 )
 
 
+_canonical_models_cache: Optional[Tuple[str, ...]] = None
+
+
 def get_canonical_models() -> list:
     """
-    Canonical model names accepted by the underlying faster-whisper engine.
-
-    Sourced from faster_whisper.available_models() so this list stays in sync
-    with whatever version of faster-whisper is installed, instead of being
-    hardcoded here.
+    Canonical model names from faster-whisper, in their native order. Cached at
+    first call so faster_whisper.available_models() is only consulted once.
     """
-    try:
-        from faster_whisper import available_models
-        return list(available_models())
-    except Exception:
-        # Defensive fallback if the import surface ever changes upstream.
-        return [
-            "tiny.en", "tiny", "base.en", "base", "small.en", "small",
-            "medium.en", "medium", "large-v1", "large-v2", "large-v3", "large",
-            "distil-large-v2", "distil-medium.en", "distil-small.en",
-            "distil-large-v3", "distil-large-v3.5", "large-v3-turbo", "turbo",
-        ]
+    global _canonical_models_cache
+    if _canonical_models_cache is None:
+        try:
+            from faster_whisper import available_models
+            _canonical_models_cache = tuple(available_models())
+        except Exception:
+            _canonical_models_cache = (
+                "tiny.en", "tiny", "base.en", "base", "small.en", "small",
+                "medium.en", "medium", "large-v1", "large-v2", "large-v3", "large",
+                "distil-large-v2", "distil-medium.en", "distil-small.en",
+                "distil-large-v3", "distil-large-v3.5", "large-v3-turbo", "turbo",
+            )
+    return list(_canonical_models_cache)
+
+
+def build_available_models() -> list:
+    """Build the /v1/models list: whisper-1 alias plus all canonical names."""
+    models = [{"id": "whisper-1", "object": "model", "owned_by": "openai"}]
+    for name in get_canonical_models():
+        models.append({"id": name, "object": "model", "owned_by": "whisperx"})
+    return models
 
 
 # OpenAI-style aliases → canonical faster-whisper names. These are kept for

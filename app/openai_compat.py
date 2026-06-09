@@ -32,7 +32,7 @@ from app.pipeline import (
     load_whisper_model,
     clear_gpu_memory,
     format_timestamp,
-    get_canonical_models,
+    build_available_models,
     transcribe as pipeline_transcribe,
     align as pipeline_align,
     _whisper_models as loaded_models,
@@ -402,16 +402,7 @@ async def create_translation(
     )
 
 
-# Available whisper models. Built from faster_whisper.available_models() so
-# this list stays in sync with whatever engine version is installed.
-def _build_available_models():
-    models = [{"id": "whisper-1", "object": "model", "owned_by": "openai"}]
-    for name in get_canonical_models():
-        models.append({"id": name, "object": "model", "owned_by": "whisperx"})
-    return models
-
-
-AVAILABLE_MODELS = _build_available_models()
+AVAILABLE_MODELS = build_available_models()
 
 
 @models_router.get("/models")

@@ -32,7 +32,7 @@ from app.pipeline import (
     format_timestamp,
     sanitize_float_values,
     resolve_model_name,
-    get_canonical_models,
+    build_available_models,
     _whisper_models as loaded_models,
 )
 from app import metrics as prom_metrics
@@ -72,21 +72,7 @@ MODEL_MAPPING = {
     "whisper-tiny": "tiny",
 }
 
-def _build_available_models():
-    """
-    Build the /v1/models response from faster-whisper's authoritative list,
-    so this stays in sync with whatever engine version is installed.
-
-    The OpenAI-compat alias `whisper-1` is added on top because some client
-    SDKs hard-code it; everything else is canonical.
-    """
-    models = [{"id": "whisper-1", "object": "model", "owned_by": "openai"}]
-    for name in get_canonical_models():
-        models.append({"id": name, "object": "model", "owned_by": "whisperx"})
-    return models
-
-
-AVAILABLE_MODELS = _build_available_models()
+AVAILABLE_MODELS = build_available_models()
 
 
 def create_openai_error(status_code, message, error_type="invalid_request_error",
