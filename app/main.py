@@ -3,7 +3,9 @@ WhisperX ASR API Service
 Compatible with openai-whisper-asr-webservice API endpoints
 """
 
+import json
 import os
+import subprocess
 import time
 import tempfile
 import logging
@@ -14,7 +16,6 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-import whisperx
 
 from app.version import __version__
 from app.pipeline import (
@@ -50,6 +51,20 @@ logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1000"))
 SERVE_MODE = os.getenv("SERVE_MODE", "simple")
+
+
+def _probe_audio_duration(path: str) -> float:
+    """Return audio duration in seconds via ffprobe without decoding the file."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return float(out.strip())
+    except Exception:
+        return 0.0
 
 
 @asynccontextmanager
@@ -188,11 +203,7 @@ async def transcribe_audio(
 
         logger.info(f"Processing audio file: {audio_file.filename} ({file_size_mb:.1f}MB), model: {model}, language: {language}")
 
-        # Load audio in the parent purely so we can observe duration. The
-        # worker subprocess will re-load the file internally; we pass the
-        # FILE PATH (not the array) across the process boundary.
-        audio = whisperx.load_audio(temp_audio_path)
-        prom_metrics.AUDIO_DURATION.observe(len(audio) / 16000.0)
+        prom_metrics.AUDIO_DURATION.observe(_probe_audio_duration(temp_audio_path))
 
         # Delegate transcription to the worker subprocess for VRAM isolation.
         result, speaker_embeddings = await request.app.state.worker_pool.asubmit(
@@ -211,8 +222,8 @@ async def transcribe_audio(
         )
 
         detected_language = result.get("language", language or "en")
+        metric_status = "ok"
 
-        # Format output based on requested format
         if output_format == "json":
             response_data = {
                 "text": result.get("segments", []),
@@ -225,12 +236,10 @@ async def transcribe_audio(
                 response_data["speaker_embeddings"] = sanitize_float_values(speaker_embeddings)
                 logger.info(f"Including speaker embeddings in response: {list(speaker_embeddings.keys())}")
 
-            metric_status = "ok"
             return JSONResponse(content=response_data)
 
         elif output_format == "text":
             text = " ".join([seg.get("text", "") for seg in result.get("segments", [])])
-            metric_status = "ok"
             return {"text": text}
 
         elif output_format == "srt":
@@ -246,7 +255,6 @@ async def transcribe_audio(
 
                 srt_content.append(f"{i}\n{start_time} --> {end_time}\n{text}\n")
 
-            metric_status = "ok"
             return {"srt": "\n".join(srt_content)}
 
         elif output_format == "vtt":
@@ -262,7 +270,6 @@ async def transcribe_audio(
 
                 vtt_content.append(f"{start_time} --> {end_time}\n{text}\n")
 
-            metric_status = "ok"
             return {"vtt": "\n".join(vtt_content)}
 
         elif output_format == "tsv":
@@ -274,10 +281,10 @@ async def transcribe_audio(
                 speaker = segment.get("speaker", "")
                 tsv_content.append(f"{start}\t{end}\t{text}\t{speaker}")
 
-            metric_status = "ok"
             return {"tsv": "\n".join(tsv_content)}
 
         else:
+            metric_status = "error"
             raise HTTPException(status_code=400, detail=f"Unsupported output format: {output_format}")
 
     except HTTPException as e:

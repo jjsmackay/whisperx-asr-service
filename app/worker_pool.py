@@ -12,7 +12,9 @@ import asyncio
 import logging
 import multiprocessing as mp
 import os
+import queue as queue_mod
 import threading
+import time
 import uuid
 from typing import Any, Callable, Optional, Tuple
 
@@ -114,12 +116,7 @@ class WorkerPool:
             log.info("worker spawned pid=%s", self._process.pid)
 
     def _await_response(self, request_id: str) -> Tuple[Any, Any]:
-        import queue as queue_mod
-
-        deadline = None
-        if self._response_timeout > 0:
-            import time
-            deadline = time.monotonic() + self._response_timeout
+        deadline = (time.monotonic() + self._response_timeout) if self._response_timeout > 0 else None
 
         poll = 0.5
         while True:
@@ -132,12 +129,10 @@ class WorkerPool:
                     raise RuntimeError(
                         f"worker subprocess exited unexpectedly (exit code {exitcode})"
                     )
-                if deadline is not None:
-                    import time
-                    if time.monotonic() > deadline:
-                        raise TimeoutError(
-                            f"worker did not respond within {self._response_timeout}s"
-                        )
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"worker did not respond within {self._response_timeout}s"
+                    )
                 continue
 
             if rid != request_id:
