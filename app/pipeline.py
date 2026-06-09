@@ -181,6 +181,41 @@ def _ensure_eviction_thread():
         )
 
 
+def _evict_from_cache(
+    cache: dict,
+    last_used: dict,
+    label: str,
+    now: float,
+    with_metrics: bool = False,
+) -> bool:
+    """Evict entries idle longer than MODEL_KEEP_ALIVE_SECONDS from a model cache.
+
+    Snapshots last_used under the lock, then re-checks inside the lock before
+    deleting to avoid racing against concurrent loaders.
+    Returns True if at least one entry was evicted.
+    """
+    with _model_load_lock:
+        snapshot = list(last_used.items())
+    candidates = [k for k, last in snapshot
+                  if now - last > MODEL_KEEP_ALIVE_SECONDS and k in cache]
+    evicted_any = False
+    for key in candidates:
+        with _model_load_lock:
+            last = last_used.get(key, 0)
+            if key in cache and now - last > MODEL_KEEP_ALIVE_SECONDS:
+                logger.info(f"Evicting idle {label} {key}")
+                del cache[key]
+                last_used.pop(key, None)
+                evicted_any = True
+                if with_metrics:
+                    try:
+                        from app import metrics as prom_metrics
+                        prom_metrics.MODEL_EVICTIONS_TOTAL.labels(model=key).inc()
+                    except Exception:
+                        pass
+    return evicted_any
+
+
 def _eviction_loop():
     global _diarize_pipeline, _diarize_last_used
     while True:
@@ -188,38 +223,12 @@ def _eviction_loop():
         if MODEL_KEEP_ALIVE_SECONDS <= 0:
             continue
         now = time.time()
-        candidates = [
-            name for name, last in list(_whisper_models_last_used.items())
-            if now - last > MODEL_KEEP_ALIVE_SECONDS and name in _whisper_models
-        ]
-        evicted_any = False
-        for name in candidates:
-            with _model_load_lock:
-                last = _whisper_models_last_used.get(name, 0)
-                if name in _whisper_models and now - last > MODEL_KEEP_ALIVE_SECONDS:
-                    logger.info(f"Evicting idle model {name}")
-                    del _whisper_models[name]
-                    _whisper_models_last_used.pop(name, None)
-                    evicted_any = True
-                    try:
-                        from app import metrics as prom_metrics
-                        prom_metrics.MODEL_EVICTIONS_TOTAL.labels(model=name).inc()
-                    except Exception:
-                        pass
-
-        # Sweep idle alignment models (per-language cache).
-        align_candidates = [
-            lang for lang, last in list(_align_models_last_used.items())
-            if now - last > MODEL_KEEP_ALIVE_SECONDS and lang in _align_models
-        ]
-        for lang in align_candidates:
-            with _model_load_lock:
-                last = _align_models_last_used.get(lang, 0)
-                if lang in _align_models and now - last > MODEL_KEEP_ALIVE_SECONDS:
-                    logger.info(f"Evicting idle alignment model for language {lang}")
-                    del _align_models[lang]
-                    _align_models_last_used.pop(lang, None)
-                    evicted_any = True
+        evicted_any = _evict_from_cache(
+            _whisper_models, _whisper_models_last_used, "model", now, with_metrics=True
+        )
+        evicted_any |= _evict_from_cache(
+            _align_models, _align_models_last_used, "alignment model for language", now
+        )
 
         # Sweep idle diarization pipeline (singleton).
         if (
