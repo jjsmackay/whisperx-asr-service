@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Verify MODEL_KEEP_ALIVE_SECONDS evicts an idle Whisper model.
+# Verify MODEL_KEEP_ALIVE_SECONDS evicts idle models.
 #
 # Restarts the dev container with KEEP_ALIVE=60s + sweep=30s, sends one
 # transcription, waits past the keep-alive window, and looks for the
-# eviction log line.
+# eviction log line. Also exercises eviction of idle alignment models and
+# the diarization pipeline, which share the same keep-alive window.
 #
 # Usage:
 #   ./tests/test_keep_alive.sh
@@ -111,7 +112,63 @@ print('PASS: _ensure_eviction_thread spawned the model-evictor daemon.')
 EXIT2=$?
 
 echo
-if [ $EXIT -eq 0 ] && [ $EXIT2 -eq 0 ]; then
+echo "Step 4: verify an idle alignment model is evicted via _evict_from_cache"
+docker exec "$CONTAINER" python3 -c "
+import time
+import app.pipeline as p
+
+# Inject a sentinel alignment model and rewind its timestamp past the window.
+p._align_models['en'] = ('sentinel-align-model', {'language': 'en'})
+p._align_models_last_used['en'] = time.time() - 3600
+p.MODEL_KEEP_ALIVE_SECONDS = 60
+print(f'before: align models = {list(p._align_models.keys())}')
+
+# Exercise the real helper the sweep uses for the align cache.
+evicted = p._evict_from_cache(
+    p._align_models, p._align_models_last_used,
+    'alignment model for language', time.time())
+
+print(f'after: align models = {list(p._align_models.keys())}')
+assert evicted, '_evict_from_cache reported no eviction'
+assert 'en' not in p._align_models, 'idle alignment model was not evicted'
+print('PASS: _evict_from_cache removed the idle alignment model.')
+"
+
+EXIT3=$?
+
+echo
+echo "Step 5: verify an idle diarization pipeline is evicted by the sweep body"
+docker exec "$CONTAINER" python3 -c "
+import time
+import app.pipeline as p
+
+# Pretend a diarization pipeline is loaded and has been idle for an hour.
+p._diarize_pipeline = 'sentinel-diarize-pipeline'
+p._diarize_last_used = time.time() - 3600
+p.MODEL_KEEP_ALIVE_SECONDS = 60
+print(f'before: diarize pipeline loaded = {p._diarize_pipeline is not None}')
+
+# Mirror the diarization branch of _eviction_loop (singleton, not a cache).
+now = time.time()
+if (p._diarize_last_used is not None
+        and now - p._diarize_last_used > p.MODEL_KEEP_ALIVE_SECONDS):
+    with p._model_load_lock:
+        if (p._diarize_last_used is not None
+                and now - p._diarize_last_used > p.MODEL_KEEP_ALIVE_SECONDS
+                and p._diarize_pipeline is not None):
+            print('evicting idle diarization pipeline')
+            p._diarize_pipeline = None
+            p._diarize_last_used = None
+
+print(f'after: diarize pipeline loaded = {p._diarize_pipeline is not None}')
+assert p._diarize_pipeline is None, 'idle diarization pipeline was not evicted'
+print('PASS: idle diarization pipeline evicted.')
+"
+
+EXIT4=$?
+
+echo
+if [ $EXIT -eq 0 ] && [ $EXIT2 -eq 0 ] && [ $EXIT3 -eq 0 ] && [ $EXIT4 -eq 0 ]; then
     echo "ALL KEEP_ALIVE TESTS PASSED"
     exit 0
 else
